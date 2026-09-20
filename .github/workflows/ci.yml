@@ -1,0 +1,226 @@
+name: CI
+
+# Green from commit 1. Secret scan + lint + type-check + tests on every push and
+# PR, plus a kind-in-CI smoke that stands up the k8s manifests + KEDA on a real
+# (ephemeral) cluster and proves the searcher Deployment autoscales on backlog.
+# The eval-regression gate (Phase 3) gets added to this same workflow next.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for committed secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check .
+
+      - name: Type-check (ty)
+        run: uv run ty check
+
+      - name: Tests (pytest)
+        run: uv run pytest
+
+  integration:
+    name: integration tests (Postgres + Redis)
+    needs: quality
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: argus
+          POSTGRES_PASSWORD: argus
+          POSTGRES_DB: argus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U argus -d argus"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:8.0-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # No LLM here — these tests use fakes for the model and skip the Ollama-only
+      # RAG round-trip; they exercise the DB schema + ARQ-on-Redis paths for real.
+      ARGUS_DATABASE_URL: postgresql://argus:argus@localhost:5432/argus
+      ARGUS_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Apply migrations
+        run: uv run argus migrate
+
+      - name: Integration tests
+        run: uv run pytest -m integration
+
+  k8s-smoke:
+    name: k8s + KEDA autoscaling smoke (kind)
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app image (load into local docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: argus:ci
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: argus-ci
+
+      - name: Load image into kind
+        run: kind load docker-image argus:ci --name argus-ci
+
+      - name: Install KEDA v2.20.0
+        run: |
+          kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.20.0/keda-2.20.0-core.yaml
+          kubectl -n keda rollout status deploy/keda-operator --timeout=180s
+
+      - name: Apply manifests, test Redis, and test secret
+        run: |
+          kubectl apply -f k8s/searcher-worker.yaml
+          kubectl apply -f k8s/api.yaml
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: redis, namespace: argus}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: redis}}
+            template:
+              metadata: {labels: {app: redis}}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:8.0-alpine
+                    ports: [{containerPort: 6379}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: redis, namespace: argus}
+          spec:
+            selector: {app: redis}
+            ports: [{port: 6379, targetPort: 6379}]
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: postgres, namespace: argus}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: postgres}}
+            template:
+              metadata: {labels: {app: postgres}}
+              spec:
+                containers:
+                  - name: postgres
+                    image: pgvector/pgvector:pg18
+                    env:
+                      - name: POSTGRES_USER
+                        value: argus
+                      - name: POSTGRES_PASSWORD
+                        value: argus
+                      - name: POSTGRES_DB
+                        value: argus
+                    ports: [{containerPort: 5432}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: postgres, namespace: argus}
+          spec:
+            selector: {app: postgres}
+            ports: [{port: 5432, targetPort: 5432}]
+          YAML
+          kubectl -n argus create secret generic argus-secrets \
+            --from-literal=ANTHROPIC_API_KEY=test-key \
+            --from-literal=ARGUS_DATABASE_URL=postgresql://argus:argus@postgres:5432/argus \
+            --from-literal=ARGUS_REDIS_URL=redis://redis.argus.svc.cluster.local:6379/0 \
+            --from-literal=REDIS_PASSWORD= \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n argus set image deploy/argus-api api=argus:ci
+          kubectl -n argus set image deploy/argus-searcher searcher=argus:ci
+
+      - name: API becomes healthy
+        run: |
+          kubectl -n argus rollout status deploy/postgres --timeout=120s
+          kubectl -n argus rollout status deploy/redis --timeout=120s
+          kubectl -n argus rollout status deploy/argus-api --timeout=180s
+          kubectl -n argus port-forward svc/argus-api 18080:80 &
+          sleep 3
+          ok=
+          for _ in $(seq 1 30); do
+            if curl -fsS -m 3 http://127.0.0.1:18080/api/health; then ok=1; break; fi
+            sleep 2
+          done
+          [ -n "$ok" ] || { echo "health check failed"; exit 1; }
+          echo; echo "health OK"
+
+      - name: KEDA scales searchers on backlog
+        run: |
+          base=$(kubectl -n argus get deploy argus-searcher -o jsonpath='{.spec.replicas}' || echo 0)
+          echo "baseline replicas: ${base:-0}"
+          RPOD=$(kubectl -n argus get pod -l app=redis -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n argus exec "$RPOD" -- sh -c 'for i in $(seq 1 30); do redis-cli RPUSH argus:searcher:scale m$i >/dev/null; done; echo LLEN=$(redis-cli LLEN argus:searcher:scale)'
+          scaled=
+          for i in $(seq 1 30); do
+            r=$(kubectl -n argus get deploy argus-searcher -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
+            echo "t=$((i * 5))s argus-searcher replicas=${r:-0}"
+            if [ "${r:-0}" -gt 0 ] 2>/dev/null; then scaled=1; break; fi
+            sleep 5
+          done
+          [ -n "$scaled" ] || { kubectl -n argus describe scaledobject argus-searcher-scaler; exit 1; }
+          echo "KEDA scale-up confirmed"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n argus get all || true
+          kubectl -n argus describe scaledobject argus-searcher-scaler || true
+          kubectl -n argus logs -l app.kubernetes.io/component=api --tail=60 || true

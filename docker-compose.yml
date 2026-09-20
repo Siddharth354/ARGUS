@@ -1,0 +1,55 @@
+# Local backing services for Argus. SearXNG (the web_search backend) is always on;
+# its host port comes from ARGUS_SEARXNG_PORT (default 8080), and `make up` selects
+# the first free port and writes it to .env so the app and the container agree.
+# Postgres + pgvector (the `data` profile) backs contextual RAG. Phase 1+ add the
+# OTel collector + Grafana/Tempo; Phase 2 adds an ARQ-on-Redis work queue.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: argus-searxng
+    ports:
+      - "${ARGUS_SEARXNG_PORT:-8080}:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:${ARGUS_SEARXNG_PORT:-8080}/
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: argus-postgres
+    profiles: ["data"]
+    environment:
+      POSTGRES_USER: argus
+      POSTGRES_PASSWORD: argus
+      POSTGRES_DB: argus
+    ports:
+      - "${ARGUS_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # pg18+ stores data in a major-version subdir; the mount must be at
+      # /var/lib/postgresql, not /var/lib/postgresql/data, or the image refuses to start.
+      - argus-pgdata:/var/lib/postgresql
+      # initdb runs every *.sql here in order on a fresh volume — the same
+      # migrations `argus migrate` applies to a managed/k8s Postgres.
+      - ./scripts/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # OpenTelemetry trace backend (the `otel` profile). Ingests OTLP on 4318 and
+  # serves the trace UI on http://localhost:16686. Pair with ARGUS_OTEL_ENABLED=true.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: argus-jaeger
+    profiles: ["otel"]
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    restart: unless-stopped
+
+volumes:
+  argus-pgdata:
